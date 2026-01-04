@@ -1,3 +1,4 @@
+# 优先推荐：启用 Hugging Face 的 hf_transfer 加速（通常提升最明显）
 import argparse
 from huggingface_hub import hf_hub_download
 
