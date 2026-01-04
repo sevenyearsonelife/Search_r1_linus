@@ -57,6 +57,10 @@
 
 ## 安装
 
+### 两个conda环境备注
+conda安装的包要注意默认的缓存位置。
+让claude执行的时候，需要修改到数据盘。
+
 ### Search-r1 环境
 ```bash
 conda create -n searchr1 python=3.9
@@ -70,7 +74,7 @@ pip3 install vllm==0.6.3 # 或者您可以安装 0.5.4、0.4.2 和 0.3.1
 pip install -e .
 
 # flash attention 2
-pip3 install flash-attn --no-build-isolation
+pip3 install flash-attn --no-build-isolation # 可以先不安装，在训练grpo的时候没有用这个
 pip install wandb
 ```
 
@@ -97,7 +101,10 @@ pip install uvicorn fastapi
 
 (1) 下载索引和语料库。
 ```bash
-save_path=/保存路径
+# 启动searchr1环境
+# 这两份文件比较大，一个40G，一个20G
+# 下载hf的大文件，都需要设置镜像网站以及access token
+save_path=/root/autodl-tmp/data # 设置为数据盘
 python scripts/download.py --save_path $save_path
 cat $save_path/part_* > $save_path/e5_Flat.index
 gzip -d $save_path/wiki-18.jsonl.gz
@@ -105,7 +112,8 @@ gzip -d $save_path/wiki-18.jsonl.gz
 
 (2) 处理 NQ 数据集。
 ```bash
-python scripts/data_process/nq_search.py
+source /root/miniconda3/etc/profile.d/conda.sh && conda activate searchr1 && export HF_TOKEN=YOUR_HF_TOKEN && export HF_DATASETS_CACHE=/root/autodl-tmp/huggingface_cache/datasets && export HF_ENDPOINT=https://hf-mirror.com && python scripts/data_process/nq_search.py  # 注意，nq_search.py中的路径已经修改/root/autodl-tmp/data/nq_search
+#python scripts/data_process/nq_search.py
 ```
 
 (3) 启动本地检索服务器。
@@ -116,6 +124,10 @@ bash retrieval_launch.sh
 
 (4) 使用 Llama-3.2-3b-base 运行 RL 训练（PPO）。
 ```bash
+# 在RL脚本开头加上如下几行
+# export HF_HOME=/root/autodl-tmp/huggingface_cache
+# export HF_ENDPOINT=https://hf-mirror.com  # 国内加速
+# export DATA_DIR='/root/autodl-tmp/data/nq_search'
 conda activate searchr1
 bash train_ppo.sh
 ```
