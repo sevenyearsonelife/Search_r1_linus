@@ -99,7 +99,7 @@ pip install uvicorn fastapi
 
 在 NQ 数据集上使用 e5 作为检索器和 wikipedia 作为语料库训练推理 + 搜索 LLM。
 
-(1) 下载索引和语料库。
+(1) 下载索引和语料库。# 直接还用tavily代替
 ```bash
 # 启动searchr1环境
 # 这两份文件比较大，一个40G，一个20G
@@ -122,7 +122,7 @@ conda activate retriever
 bash retrieval_launch.sh
 ```
 
-(4) 使用 Llama-3.2-3b-base 运行 RL 训练（PPO）。
+(4) 使用 qwen 运行 RL 训练（PPO）。
 ```bash
 # 在RL脚本开头加上如下几行
 # export HF_HOME=/root/autodl-tmp/huggingface_cache
