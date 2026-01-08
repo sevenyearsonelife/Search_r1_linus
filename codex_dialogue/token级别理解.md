@@ -989,7 +989,7 @@ A(s_t,a_t) \triangleq Q(s_t,a_t) - V(s_t)
 ---
 
 ### 问题 14
-用户：主要value[i]定义为第t+1个token还没产生时的预测，那么advantage[i] = Q - V在数学上就完美契合了  
+用户：只要value[i]定义为第t+1个token还没产生时的预测，那么advantage[i] = Q - V在数学上就完美契合了  
 助手：对，你这个结论在这份实现的对齐方式下是“数学上最干净”的：
 
 - 令 \(t=i+1\)（1-based 时间步），状态 \(s_t\) 是“第 \(t\) 个 token 还没产生时”的前缀。
