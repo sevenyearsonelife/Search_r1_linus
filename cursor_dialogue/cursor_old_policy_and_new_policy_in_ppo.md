@@ -1,5 +1,5 @@
 # Old policy and new policy in PPO
-_Exported on 2026/2/25 at GMT+8 20:17:33 from Cursor (2.5.25)_
+_Exported on 2026/2/25 at GMT+8 20:21:51 from Cursor (2.5.25)_
 
 ---
 
@@ -596,4 +596,173 @@ veRL 本身的 `trainer.fit()` 是写死的 `for` 循环（如我们之前在 `r
 **User**
 
 veRL 本身的 trainer.fit() 是写死的 for 循环干了那几件事？请给出伪代码并逐步解释！
+
+---
+
+**Cursor**
+
+让我重新精读一下 `fit()` 的完整代码，确保覆盖所有细节。
+
+好，以下是 veRL 的 `trainer.fit()` 的完整伪代码拆解。整个训练主循环可以精确划分为 **8 个严格串行的阶段**。
+
+---
+
+### 伪代码总览
+
+```python
+def fit():
+    # ===== 阶段 0：训练前验证（可选） =====
+    if 开启了训练前验证:
+        val_metrics = validate()
+        log(val_metrics)
+
+    for epoch in range(total_epochs):
+        for batch in train_dataloader:
+
+            # ===== 阶段 1：Rollout 生成 =====
+            # 🔴 同步阻塞点：必须等所有样本全部生成完毕
+            if 不需要搜索(普通QA):
+                gen_output = actor.generate_sequences(batch)  # 内含 old_log_probs
+            else:  # Search-R1 的多轮搜索智能体模式
+                gen_output = generation_manager.run_llm_loop(batch)  # 多轮 生成→搜索→拼接
+                old_log_probs = actor.compute_log_prob(gen_output)   # 事后重算 old_log_probs
+
+            # ===== 阶段 2：序列长度均衡 =====
+            balance_batch(batch)  # 按 token 数重排，让各 DP rank 负载均衡
+
+            # ===== 阶段 3：Reference Model 前向推理 =====
+            if 使用参考模型:
+                ref_log_prob = ref_policy.compute_ref_log_prob(batch)
+
+            # ===== 阶段 4：Critic Model 前向推理 =====
+            if 使用价值网络(PPO 模式):
+                values = critic.compute_values(batch)
+
+            # ===== 阶段 5：计算 Reward → KL惩罚 → Advantage =====
+            if 使用奖励模型:
+                rm_scores = reward_model.compute_rm_score(batch)
+            rule_scores = reward_fn(batch)                     # 规则打分（如 EM 精确匹配）
+            token_level_rewards = rule_scores - β * KL(old_log_probs, ref_log_prob)  # KL 惩罚
+            advantages, returns = compute_advantage(rewards, values)  # GAE 或 GRPO
+
+            # ===== 阶段 6：更新 Critic（反向传播） =====
+            if 使用价值网络:
+                critic.update_critic(batch)  # MSE Loss: (values - returns)²
+
+            # ===== 阶段 7：更新 Actor（反向传播） =====
+            if 已过 critic_warmup 阶段:
+                actor.update_actor(batch)    # PPO Clip Loss
+
+            # ===== 阶段 8：验证 & 保存 =====
+            if 到了验证频率:
+                validate()
+            if 到了保存频率:
+                save_checkpoint()
+
+            log(metrics)
+            global_steps += 1
+```
+
+---
+
+### 逐阶段详细解释
+
+#### 阶段 0：训练前验证（Pre-train Validation）
+对应代码行 665-670。
+
+在任何训练步骤开始之前，先用当前的初始模型跑一次验证集，获取一个 **Baseline 分数**。这个分数会被记录到 WandB 等日志系统中，便于后续观察训练带来的增益。
+
+#### 阶段 1：Rollout 生成（🔴 最大的同步阻塞点）
+对应代码行 710-748。
+
+这是整个循环中**耗时最长、方差最大**的阶段。分两条路径：
+
+**路径 A（普通 QA，不搜索）**：直接调用 vLLM 批量生成回答。vLLM 内部的 `generate_sequences` 已经在 Rollout 过程中顺带算好了 `old_log_probs`，一次调用搞定。
+
+**路径 B（Search-R1 多轮搜索模式）**：调用 `generation_manager.run_llm_loop()`，这是一个 Python `for` 循环，每一轮：
+1. Actor 生成一段文本（可能包含 `<search>query</search>`）
+2. 解析出搜索请求，发送 HTTP 到检索服务器（🔴 网络 I/O 等待）
+3. 拿到搜索结果，拼接到上下文中
+4. 继续生成下一段
+5. 重复直到模型输出 `<answer>` 或达到 `max_turns`
+
+循环结束后，由于多轮拼接导致序列发生了变化，需要**额外调用一次 `compute_log_prob`** 来重新计算整条完整序列的 `old_log_probs`（路径 A 中这一步是 vLLM 生成时顺带完成的）。
+
+#### 阶段 2：序列长度均衡（Sequence Length Balancing）
+对应代码行 753-764。
+
+不同样本生成的序列长度差异巨大（有的 100 tokens，有的 4000 tokens）。如果不做处理，直接平均分配给各个 Data Parallel (DP) rank，有的 GPU 吃到全是短序列（几秒算完），有的 GPU 吃到全是长序列（算半天）。
+`_balance_batch` 会按照每条数据的实际 token 数做**贪心分配**，让每个 DP rank 分到的总 token 数尽量接近，最小化各卡之间的等待时间。
+
+#### 阶段 3：Reference Model 前向推理
+对应代码行 766-770。
+
+把**冻结的 Reference 模型**（SFT 初始权重）加载到 GPU 上，对整个 Batch 的完整序列做一次前向推理，算出 `ref_log_prob`（每个 token 在初始模型眼里的概率）。这个值后面会用于计算 KL 散度惩罚。
+
+#### 阶段 4：Critic Model 前向推理
+对应代码行 772-776。
+
+如果是标准 PPO（使用 GAE 优势估计），则需要 Critic（价值网络）对每个 token 位置做一次估值预测（"我觉得从这个状态开始，未来总共能拿多少分"）。输出 `values` 张量，形状为 `(batch_size, response_length)`。
+
+如果用的是 GRPO 算法，这一步直接跳过（GRPO 不需要 Critic）。
+
+#### 阶段 5：计算 Reward → KL 惩罚 → Advantage（🧮 核心数学计算）
+对应代码行 778-805。
+
+这是整个 PPO 数据流中**信息汇聚点**，之前所有阶段产出的张量在这里交汇：
+
+```
+token_level_scores  ← Reward Model 或规则打分（如精确匹配得 1 分）
+old_log_probs       ← 阶段 1 的 Actor 输出
+ref_log_prob        ← 阶段 3 的 Reference 输出
+values              ← 阶段 4 的 Critic 输出
+```
+
+计算链路：
+1. **原始分数** `token_level_scores`：通常只有最后一个 token 位置有非零值（Outcome Reward）。
+2. **KL 惩罚**：`token_level_rewards = scores - β × (old_log_probs - ref_log_prob)`，在每个 token 级别扣掉偏离 Reference 的惩罚。
+3. **GAE Advantage**：利用 `token_level_rewards` 和 `values` 做时序差分（TD），算出每个 token 的优势值（"这一步比预期好多少"）。
+
+#### 阶段 6：更新 Critic（反向传播）
+对应代码行 807-812。
+
+Critic 用 `returns`（实际回报）和自己之前的预测 `values` 算 MSE Loss，做反向传播更新权重。目标是让 Critic 下次估值更准。
+
+#### 阶段 7：更新 Actor（反向传播）
+对应代码行 814-822。
+
+这是 PPO 算法的核心更新步骤。Actor 会：
+1. 用当前（已更新过若干微步的）权重重新算 `log_probs`
+2. 计算 Importance Sampling Ratio：`ratio = exp(log_probs - old_log_probs)`
+3. 应用 PPO Clip：`clamp(ratio, 1-ε, 1+ε)`
+4. 用 `advantages` 加权，算出 Policy Gradient Loss
+5. 反向传播，更新 Actor 权重
+
+注意：代码里有一个 `critic_warmup` 机制（行 815）。在训练最初的若干步里，只更新 Critic 不更新 Actor，让 Critic 先学会给出靠谱的估值，避免 Actor 在"瞎子引路"的估值下乱学。
+
+#### 阶段 8：验证 & 保存
+对应代码行 824-834。
+
+按照配置的频率，周期性地跑验证集、保存 Checkpoint。
+
+---
+
+### 时间线可视化
+
+用一张时间线图来直观展示**每个阶段的串行依赖关系和典型耗时占比**：
+
+```
+时间 ──────────────────────────────────────────────────────────────────►
+
+│ 阶段1: Rollout         │阶段2│ 阶段3 │ 阶段4 │  阶段5  │阶段6│ 阶段7 │阶段8│
+│ (生成 + 搜索)           │均衡  │ Ref   │Critic │ Reward  │更新  │ 更新  │验证 │
+│ 🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴│ ··  │ ███  │ ███  │  ██   │ ███ │ ███  │ ·· │
+│ ← 占总时间 60%~90% →   │     │       │       │(CPU轻量)│     │      │    │
+
+阶段1 ──→ 阶段2 ──→ 阶段3 ──→ 阶段4 ──→ 阶段5 ──→ 阶段6 ──→ 阶段7 ──→ 阶段8
+  ↑                                                                        │
+  └────────────────── 下一个 batch ←───────────────────────────────────────┘
+```
+
+**关键结论：** 整个 `fit()` 就是一个**严格串行的 8 阶段流水线**。每个阶段都必须等前一个阶段完全结束才能开始，没有任何并行或流水线重叠。其中**阶段 1（Rollout）**在 Search-R1 场景下占据了绝大多数时间，这正是前面我们讨论的同步 RL 瓶颈的根源。
 
