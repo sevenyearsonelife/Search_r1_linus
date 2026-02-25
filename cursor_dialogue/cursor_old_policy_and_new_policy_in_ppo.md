@@ -1,5 +1,5 @@
 # Old policy and new policy in PPO
-_Exported on 2026/2/25 at GMT+8 20:21:51 from Cursor (2.5.25)_
+_Exported on 2026/2/25 at GMT+8 20:32:53 from Cursor (2.5.25)_
 
 ---
 
@@ -765,4 +765,108 @@ Critic 用 `returns`（实际回报）和自己之前的预测 `values` 算 MSE 
 ```
 
 **关键结论：** 整个 `fit()` 就是一个**严格串行的 8 阶段流水线**。每个阶段都必须等前一个阶段完全结束才能开始，没有任何并行或流水线重叠。其中**阶段 1（Rollout）**在 Search-R1 场景下占据了绝大多数时间，这正是前面我们讨论的同步 RL 瓶颈的根源。
+
+---
+
+**User**
+
+在ppo训练中,有没有使用微批次和梯度累积? 
+
+---
+
+**Cursor**
+
+好问题！让我追踪一下从 `update_actor` 到实际反向传播的完整代码链路。
+
+非常好，代码证据非常充分。**答案是：是的，veRL 的 PPO 训练中同时使用了微批次（Micro-batch）和梯度累积（Gradient Accumulation）。** 而且它的数据分割是一个**三层嵌套结构**。
+
+---
+
+### 三层数据分割：Train Batch → Mini-batch → Micro-batch
+
+以默认配置（`ppo_trainer.yaml`）为例来走一遍：
+
+```
+train_batch_size = 1024   （一次 Rollout 收集的全部样本数）
+ppo_mini_batch_size = 256 （一个优化步 optimizer.step() 处理的样本数）
+ppo_micro_batch_size = 64 （一次前向+反向传播放进 GPU 的样本数）
+ppo_epochs = 1            （整个 train_batch 被遍历几次）
+```
+
+#### 第一层：Train Batch → Mini-batches
+
+```python
+# dp_actor.py 第 220 行
+dataloader = batch.split(self.config.ppo_mini_batch_size)
+```
+
+将完整的 1024 条数据切成 `1024 / 256 = 4` 个 Mini-batch。**每个 Mini-batch 对应一次 `optimizer.step()`**（即一次真正的权重更新）。
+
+#### 第二层：Mini-batch → Micro-batches（梯度累积发生在这里）
+
+```python
+# dp_actor.py 第 208 行
+self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size
+# 256 / 64 = 4 次梯度累积
+
+# dp_actor.py 第 231 行
+micro_batches = mini_batch.split(self.config.ppo_micro_batch_size)
+```
+
+每个 256 条的 Mini-batch 再切成 `256 / 64 = 4` 个 Micro-batch。每个 Micro-batch 64 条数据是 GPU 单次前向+反向传播实际能吃下的量。
+
+#### 梯度累积的核心代码
+
+```python
+# dp_actor.py 第 233 行
+self.actor_optimizer.zero_grad()          # ① 清零梯度
+
+for data in micro_batches:                # ② 循环 4 个 micro-batch
+    entropy, log_prob = self._forward_micro_batch(data)   # 前向传播
+    policy_loss = compute_policy_loss(...)                 # 算 PPO Loss
+    loss = policy_loss / self.gradient_accumulation        # ③ 关键：除以累积次数
+    loss.backward()                                        # ④ 反向传播，梯度在 .grad 中累加
+
+grad_norm = self._optimizer_step()        # ⑤ 4 个 micro-batch 的梯度累积完毕，统一更新
+```
+
+**关键行是第 275 行**：
+
+```275:275:verl/workers/actor/dp_actor.py
+                loss = policy_loss / self.gradient_accumulation
+```
+
+这就是梯度累积的经典写法：每个 Micro-batch 的 loss 除以累积次数后再 `.backward()`。由于 PyTorch 的 `.backward()` 默认是**梯度累加**（不会自动清零），循环完 4 个 Micro-batch 后，`.grad` 中累积的梯度在数学上**等价于**一次性把 256 条数据喂进去算出的梯度。最后调用一次 `optimizer.step()` 完成权重更新。
+
+Critic 的更新逻辑（`dp_critic.py`）完全一样，也用了同样的三层结构和梯度累积。
+
+---
+
+### 完整数据流的伪代码
+
+```python
+# 假设 ppo_epochs=1, train_batch=1024, mini_batch=256, micro_batch=64
+
+for epoch in range(ppo_epochs):                        # 遍历 1 次
+    for mini_batch in train_batch.split(256):          # 切成 4 个 mini-batch
+        optimizer.zero_grad()                          # 清零梯度
+        
+        for micro_batch in mini_batch.split(64):       # 每个 mini-batch 切成 4 个 micro-batch
+            loss = forward_and_compute_loss(micro_batch)
+            loss = loss / 4                            # 除以梯度累积次数
+            loss.backward()                            # 梯度累加到 .grad
+        
+        clip_grad_norm_(model.parameters(), max_norm=1.0)  # 梯度裁剪
+        optimizer.step()                               # 用累积的梯度更新一次权重
+```
+
+### 为什么要这么做？
+
+| 层级 | 目的 |
+| :--- | :--- |
+| **Train Batch (1024)** | 一次 Rollout 收集的全部经验，决定了样本多样性和统计稳定性 |
+| **Mini-batch (256)** | PPO 论文推荐的做法：将大 Batch 打散成多个小批次多次更新，提高样本利用率 |
+| **Micro-batch (64)** | 纯粹的 **GPU 显存限制**。7B 模型的一次前向+反向传播吃不下 256 条数据，只能分批累积梯度 |
+
+**核心要点**：Mini-batch 和 Micro-batch 解决的是完全不同的问题。Mini-batch 是**算法层面**的设计（PPO 论文要求多次遍历数据），Micro-batch 是**工程层面**的妥协（显存不够，分批累积）。梯度累积保证了两者在数学上的等价性——不管你是一口吞 256 条还是分 4 次吞 64 条，最终的梯度更新效果完全一致。
 
